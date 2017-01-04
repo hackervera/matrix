@@ -29,7 +29,7 @@ module Matrix
     end
 
     def initialize(@user : String = USER, @pass : String = PASS)
-      @logger = Logger.new(STDIN)
+      @logger = Logger.new(File.open("matrix.log", "w"))
       @matrix_host = MATRIX_HS.gsub(/.*\/\//, "")
       response = HTTP::Client.post(url: "#{MATRIX_HS}/_matrix/client/r0/login", body: {type: "m.login.password", user: @user, password: @pass}.to_json)
       @connection_info = ConnectionInfo.from_json(response.body)
@@ -63,6 +63,16 @@ module Matrix
 
     def upload_keys
       response = HTTP::Client.post(url: "#{MATRIX_HS}/_matrix/client/unstable/keys/upload?access_token=#{@connection_info.access_token}", body: @account.to_json)
+    end
+
+    def send_message(message, room_id)
+      tx = SecureRandom.hex
+      @logger.debug room_id
+      response = HTTP::Client.put(url: "#{MATRIX_HS}/_matrix/client/r0/rooms/#{room_id}/send/m.room.message/#{tx}?access_token=#{@connection_info.access_token}", body: {msgtype: "m.text", body: message}.to_json)
+      # puts response.body
+      # @history["logs"] ||= [""]
+      # @history["logs"] << response.body
+      @logger.debug response.body
     end
 
     def create_session(event)
@@ -146,6 +156,7 @@ module Matrix
       spawn do
         input = NCurses::Window.new(20, 80, 40)
         # LibNCurses.scrollok(input, true)
+        buffer = Array(String).new
         loop do
           sleep 0.05
           show_history
@@ -153,9 +164,27 @@ module Matrix
             if modifier == :alt
               abort :bye
             end
+            if char == 127.chr
+              char = 8.chr
+              begin
+                @logger.debug buffer.inspect
+                buffer.pop
+              rescue e
+                @logger.debug e.inspect
+              end
+            end
             next if char == :nothing
             input.print modifier.to_s
             case char
+            when :return
+              begin
+                room_id = @history.keys[@channel_selector]
+                send_message(buffer.join, room_id)
+                buffer = [""]
+                input.clear
+              rescue e
+                @logger.debug e.inspect
+              end
             when :up
               @offset += 1
               # input.print "up"
@@ -167,6 +196,7 @@ module Matrix
             when :left
               @channel_selector -= 1
             else
+              buffer << char.to_s unless char == 8.chr
               input.print char.to_s
             end
             input.refresh
