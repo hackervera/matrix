@@ -4,168 +4,28 @@ require "json"
 require "logger"
 require "secure_random"
 require "intuit"
+require "readline"
+require "ncurses"
+require "big_int"
 
 module Matrix
   USER      = ENV["MATRIX_USER"] ||= ""
   PASS      = ENV["MATRIX_PASS"] ||= ""
   MATRIX_HS = ENV["MATRIX_HS"] ||= "https://matrix.org"
-  EVENTS    = Channel::Buffered(Hash(String, JSON::Type)).new
-
-  class ConnectionInfo
-    JSON.mapping(
-      access_token: String,
-      home_server: String,
-      user_id: String,
-      device_id: String
-    )
-  end
-
-  class DecryptedKey
-    JSON.mapping(
-      algorithm: String,
-      room_id: String,
-      session_id: String,
-      session_key: String,
-      chain_index: Int32,
-    )
-  end
-
-  class NewDevice
-    JSON.mapping(
-      rooms: Array(String),
-      device_id: String
-    )
-  end
-
-  class NewSession
-    JSON.mapping(
-      sender_key: String,
-      ciphertext: JSON::Any,
-      algorithm: String
-    )
-  end
-
-  class Sync
-    JSON.mapping(
-      next_batch: String,
-      presence: Presence,
-      rooms: Rooms,
-      account_data: AccountData,
-      to_device: ToDevice
-    )
-  end
-
-  class AccountData
-    JSON.mapping(
-      events: Array(Event)
-    )
-  end
-
-  class ToDevice
-    JSON.mapping(
-      events: Array(Event)
-    )
-  end
-
-  class Presence
-    JSON.mapping(
-      events: Array(Event)
-    )
-  end
-
-  class Rooms
-    JSON.mapping(
-      invite: Hash(String, InvitedRoom),
-      join: Hash(String, JoinedRoom),
-      leave: Hash(String, LeftRoom)
-    )
-  end
-
-  class JoinedRoom
-    JSON.mapping(
-      state: State,
-      timeline: Timeline,
-      ephemeral: Ephemeral,
-      account_data: AccountData,
-      unread_notifications: UnreadNotifications
-    )
-  end
-
-  class Ephemeral
-    JSON.mapping(
-      events: Array(Event)
-    )
-  end
-
-  class UnreadNotifications
-    JSON.mapping(
-      highlight_count: Int32 | Nil,
-      notification_count: Int32 | Nil
-    )
-  end
-
-  class InvitedRoom
-    JSON.mapping(
-      invite_state: InviteState
-    )
-  end
-
-  class InviteState
-    JSON.mapping(
-      events: Array(Event)
-    )
-  end
-
-  class LeftRoom
-    JSON.mapping(
-      state: State,
-      timeline: Timeline)
-  end
-
-  class State
-    JSON.mapping(
-      events: Array(Event))
-  end
-
-  class Timeline
-    JSON.mapping(
-      events: Array(Event),
-      limited: Bool,
-      prev_batch: String)
-  end
-
-  class Event
-    JSON.mapping(
-      content: JSON::Any,
-      origin_server_ts: Int32 | Nil,
-      state_key: String | Nil,
-      type: String,
-      sender: String | Nil,
-      unsigned: Unsigned | Nil
-    )
-  end
-
-  class Unsigned
-    JSON.mapping(
-      age: Int32 | Nil,
-      prev_content: JSON::Any | Nil,
-      transaction_id: String | Nil
-    )
-  end
 
   class Client
     getter :connection_info, :user, :matrix_host, :logger
     @matrix_host : String
 
     def send_devices(user_ids, room_ids)
-      @logger.debug room_ids
+      # @logger.debug room_ids
       messages = Hash(String, Hash(String, Hash(String, Array(String) | String))).new
       user_ids.each do |user_id|
         messages[user_id] = {"*" => {"device_id" => @connection_info.device_id, "rooms" => room_ids}}
       end
-      @logger.debug messages
+      # @logger.debug messages
       response = HTTP::Client.put(url: "#{MATRIX_HS}/_matrix/client/unstable/sendToDevice/m.new_device/#{SecureRandom.hex}?access_token=#{@connection_info.access_token}", body: {messages: messages}.to_json)
-      @logger.debug response.inspect
+      # @logger.debug response.inspect
     end
 
     def initialize(@user : String = USER, @pass : String = PASS)
@@ -177,6 +37,15 @@ module Matrix
       @account.create
       @account.generate_one_time_keys(50)
       @sessions = Hash(String, Intuit::InboundGroupSession).new
+      NCurses.init
+      NCurses.raw
+      NCurses.no_echo
+      @window = NCurses::Window.new(40, 80)
+      LibNCurses.scrollok(@window, true)
+      LibNCurses.idlok(@window, true)
+      @history = Hash(String, Array(String)).new
+      @channel_selector = 0
+      @offset = 0
     end
 
     def device_list(user_ids)
@@ -184,7 +53,7 @@ module Matrix
       user_ids.each do |user_id|
         device_keys[user_id] = [] of Nil
       end
-      @logger.debug device_keys
+      # @logger.debug device_keys
       response = HTTP::Client.post(url: "#{MATRIX_HS}/_matrix/client/unstable/keys/query?access_token=#{@connection_info.access_token}", body: {"device_keys" => device_keys}.to_json)
     end
 
@@ -197,7 +66,7 @@ module Matrix
     end
 
     def create_session(event)
-      @logger.debug event
+      # @logger.debug event
       cipher_key = event.content["ciphertext"].as_h.keys.first
       cipher_body = event.content["ciphertext"][cipher_key]["body"].to_s
       cipher_copy1 = String.new(cipher_body.to_slice)
@@ -206,64 +75,115 @@ module Matrix
       session.create_inbound_from(@account, event.content["sender_key"].to_s, cipher_copy1)
       decrypted = session.decrypt(0, cipher_copy2)
       session_data = JSON.parse(decrypted)
-      @logger.debug decrypted
-      # content = JSON.parse(decrypted)
-      # @logger.debug content
+      # @logger.debug decrypted
       inbound_session = Intuit::InboundGroupSession.new(session_data["content"]["session_key"].to_s, session_data["content"]["chain_index"].as_i)
       @sessions[session_data["content"]["room_id"].to_s] = inbound_session
-      # @logger.debug inbound_session
     end
 
     def sync(timestamp = "")
+      # @history["system"] ||= Array(String).new
+      # @history["system"] << "Sync"
+      read_loop(:loop) unless @initiated
+      @initiated ||= true
+      # output "Syncing"
       since = timestamp.empty? ? timestamp : "&since=#{timestamp}"
+      # output since
       response = HTTP::Client.get(url: "#{MATRIX_HS}/_matrix/client/r0/sync?access_token=#{@connection_info.access_token}#{since}")
+      # @window.refresh
       sync_data = Sync.from_json(response.body)
-      # p sync_data
       sync_data.to_device.events.each do |event|
-        # puts event.inspect
         if event.type == "m.room.encrypted"
           create_session(event)
         end
       end
       sync_data.rooms.join.each do |room_id, joined_room|
-        puts room_id
         joined_room.timeline.events.each do |event|
           if event.type == "m.room.encrypted" && @sessions[room_id]?
-            puts event.content
-            puts event.type
+            # output room_id
+            # output event.content
+            # output event.type
             decrypted = @sessions[room_id].decrypt(event.content["ciphertext"].to_s)
-            @logger.debug decrypted
+            # output decrypted
+            decrypted_data = JSON.parse(decrypted)
+            body = decrypted_data["content"]["body"]
+            @history[room_id] ||= Array(String).new
+            @history[room_id] << "[#{event.sender} :  #{body} [encrypted]"
+          elsif event.type == "m.room.message"
+            @history[room_id] ||= Array(String).new
+            @history[room_id] << "#{event.sender} #{event.content["body"].to_s}"
           end
         end
       end
       sync(sync_data.next_batch)
-      # begin
-      #   ciphertext = JSON.parse(response.body)["rooms"]["join"]["!zspysqAuNIRFmUEVNl:matrix.org"]["timeline"]["events"][0]["content"]["ciphertext"]
-      #   @logger.debug ciphertext.to_json
-      #   if @inbound_session
-      #     # @logger.debug "HAVE SESSION"
-      #     # @logger.debug "TRying"
-      #     @logger.debug @inbound_session.as(Intuit::InboundGroupSession).decrypt(ciphertext.to_s)
-      #     # @logger.debug @inbound_session.decrypt( parsed_key.chain_index)
-      #     # @logger.debug "WAT"
-      #   end
-      # rescue e
+    end
+
+    def show_history
+      @window.clear
+      history_length = 15
+      # # @window.print "#{@history.join("\n")}\n"
+      room_id = @history.keys[@channel_selector]
+      room_messages = @history[room_id]
+      if room_messages.size < history_length
+        idx = 0
+      else
+        idx = -1 * history_length
+      end
+      size = (idx - BigInt.new(@offset)).abs
+      @window.print "Size:#{size} Offset:#{@offset}  History:#{room_messages.size} \n"
+      @window.print "#{room_id}\n"
+      @window.print room_messages[idx - @offset, history_length].join("\n") unless size > room_messages.size
+      # @window.print("\n\n")
+      # room_messages.each do |room_message|
+      #   @window.print "#{room_message}\n"
       # end
-      # @logger.debug events.keys
-      # @logger.debug next_batch
-      # event_json = events["to_device"].to_json
-      # @logger.debug event_json
-      # events = Hash(String, Array(Event)).from_json(event_json)["events"]
-      # @logger.debug events
-      # if events.size > 0
-      #   content = events.first.content
-      #   if content.class == NewSession
-      #     create_session(content)
-      #   end
-      # end
-      # @logger.debug @connection_info.device_id
-      # @logger.info "Resyncing"
-      # sync(next_batch)
+      @window.refresh
+    rescue e
+      @window.print e.inspect
+      @window.refresh
+    end
+
+    def read_loop(state)
+      spawn do
+        input = NCurses::Window.new(20, 80, 40)
+        # LibNCurses.scrollok(input, true)
+        loop do
+          sleep 0.05
+          show_history
+          input.on_input(timeout: true) do |char, modifier|
+            if modifier == :alt
+              abort :bye
+            end
+            next if char == :nothing
+            input.print modifier.to_s
+            case char
+            when :up
+              @offset += 1
+              # input.print "up"
+            when :down
+              @offset -= 1
+              # input.print "down"
+            when :right
+              @channel_selector += 1
+            when :left
+              @channel_selector -= 1
+            else
+              input.print char.to_s
+            end
+            input.refresh
+          end
+        end
+      end
+    end
+
+    def draw
+      # state = read_loop(:loop)
+      @window.print "Connecting...", [0, 0]
+      @window.refresh
+      sleep 3
+      @window.print "Connected...", [0, 0]
+      @window.refresh
+      sleep 1
+      puts "state is: "
     end
   end
 end

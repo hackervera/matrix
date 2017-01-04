@@ -43,4 +43,11 @@ describe Matrix::Client do
       end
     end
   end
+  describe "#draw" do
+    it "draws the interface to the screen" do
+      client = Matrix::Client.new
+      client.logger.level = Logger::DEBUG
+      client.draw
+    end
+  end
 end

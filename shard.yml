@@ -11,3 +11,7 @@ license: MIT
 dependencies:
   intuit:
     github: tjgillies/intuit
+  crt:
+    github: maiha/crt.cr
+  ncurses:
+    github: jreinert/ncurses-crystal
